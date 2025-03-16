@@ -42,28 +42,13 @@ class Sender:
 
     def run(self):
         seq = 0
-        while True:
-            sockets = [self.socket, sys.stdin] if not self.waiting else [self.socket]
-
-            socks = select.select(sockets, [], [], 0.1)[0]
-            for conn in socks:
-                if conn == self.socket:
-                    data = self.recv(conn)
-
-                    if data:
-                        self.waiting = False
-                elif conn == sys.stdin:
-                    data = sys.stdin.read(DATA_SIZE)
-                    if len(data) == 0:
-                        self.log("All done!")
-                        sys.exit(0)
-
-                    msg = { "type": "msg", "data": data, "seq": seq }
-                    self.send(msg)
-                    self.waiting = True
-                    seq += 1
-
-        return
+        data = sys.stdin.read()  # Read all input at once
+        while data:
+            msg = { "type": "msg", "data": data[:DATA_SIZE], "seq": seq }
+            self.send(msg)
+            data = data[DATA_SIZE:]  # Move to the next chunk
+            seq += 1
+            time.sleep(0.1)  # Add a small delay if needed
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='send data')
