@@ -1,4 +1,4 @@
-#!/usr/bin/env -S python3 -u
+#!/usr/bin/env python3
 
 import argparse, socket, time, json, select, struct, sys, math, hashlib
 
@@ -14,12 +14,6 @@ class Receiver:
         
         # Track the highest sequence number we've seen
         self.last_seq = -1
-        
-        # Buffer for out-of-order packets
-        self.buffer = {}
-        
-        # Window size for receiving
-        self.window_size = 16
 
     def send(self, message):
         self.log("Sent message %s" % json.dumps(message))
@@ -62,20 +56,6 @@ class Receiver:
         calculated_checksum = self.calculate_checksum(msg["data"])
         
         return received_checksum == calculated_checksum
-        
-    def process_buffer(self):
-        """Process any buffered packets that are now in order."""
-        # Process buffered packets as long as we have the next expected sequence number
-        next_seq = self.last_seq + 1
-        while next_seq in self.buffer:
-            # Print the data from the buffered packet
-            print(self.buffer[next_seq], end='', flush=True)
-            # Remove from buffer
-            del self.buffer[next_seq]
-            # Update last sequence number
-            self.last_seq = next_seq
-            # Check for next sequence
-            next_seq = self.last_seq + 1
 
     def run(self):
         while True:
@@ -90,28 +70,14 @@ class Receiver:
                         # Send NACK to request retransmission
                         self.send({"type": "nack", "seq": msg["seq"]})
                         continue
-                    
-                    seq = msg["seq"]
-                    
-                    # If this is the next expected packet, process it immediately
-                    if seq == self.last_seq + 1:
-                        print(msg["data"], end='', flush=True)
-                        self.last_seq = seq
                         
-                        # Process any buffered packets that are now in order
-                        self.process_buffer()
-                    # If this is a future packet, buffer it
-                    elif seq > self.last_seq + 1:
-                        self.log(f"Received out-of-order packet {seq}, buffering")
-                        # Only buffer if it's within our window
-                        if seq <= self.last_seq + self.window_size:
-                            self.buffer[seq] = msg["data"]
-                    # If this is a duplicate packet, ignore the data but still ACK it
-                    else:
-                        self.log(f"Received duplicate packet {seq}, ignoring data")
+                    # Only print out the data if this is a new sequence number
+                    if msg["seq"] > self.last_seq:
+                        print(msg["data"], end='', flush=True)
+                        self.last_seq = msg["seq"]
 
-                    # Always send back an ack for the highest in-order packet we've received
-                    self.send({"type": "ack", "seq": self.last_seq})
+                    # Always send back an ack
+                    self.send({ "type": "ack", "seq": msg["seq"] })
 
 
         return

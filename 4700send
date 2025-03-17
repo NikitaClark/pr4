@@ -1,28 +1,57 @@
 #!/usr/bin/env -S python3 -u
 
-import argparse, socket, time, json, select, struct, sys, math
+import argparse, socket, time, json, select, struct, sys, math, hashlib, collections
 
 DATA_SIZE = 1375
 
 class Sender:
     def __init__(self, host, port):
         self.host = host
-        self.port = int(port)
-        self.log("Sender starting up using port %s" % self.port)
+        self.remote_port = int(port)
+        self.log("Sender starting up using port %s" % self.remote_port)
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('0.0.0.0', 0))
+        self.local_port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.local_port)
         self.waiting = False
 
         self.remote_host = None
-        self.remote_port = None
+        
+        # RTT estimation parameters
+        self.estimated_rtt = 0.5  # Initial RTT estimate (500ms)
+        self.dev_rtt = 0.25       # Initial RTT deviation
+        self.alpha = 0.125        # Weight for new RTT samples (1/8)
+        self.beta = 0.25          # Weight for new deviation samples (1/4)
+        self.min_timeout = 0.1    # Minimum timeout (100ms)
+        self.max_timeout = 2.0    # Maximum timeout (2 seconds)
+        self.send_times = {}      # Dictionary to track send times for RTT calculation
+        
+        # Sliding window parameters
+        self.window_size = 4      # Initial window size
+        self.max_window_size = 16 # Maximum window size
+        self.in_flight = {}       # Dictionary of packets in flight (seq -> packet)
+        self.next_seq_to_send = 0 # Next sequence number to send
+        self.base_seq = 0         # Base of the window (smallest unacked seq)
+        self.duplicate_acks = collections.defaultdict(int)  # Count duplicate ACKs
 
     def log(self, message):
         sys.stderr.write(message + "\n")
         sys.stderr.flush()
 
+    def calculate_checksum(self, data):
+        """Calculate a checksum for the data."""
+        if not data:
+            return "0"
+        # Use MD5 for a simple but effective checksum
+        return hashlib.md5(data.encode('utf-8') if isinstance(data, str) else data).hexdigest()
+
     def send(self, message):
         self.log("Sending message '%s'" % json.dumps(message))
-        self.socket.sendto(json.dumps(message).encode("utf-8"), (self.host, self.port))
+        self.socket.sendto(json.dumps(message).encode("utf-8"), (self.host, self.remote_port))
+        
+        # Record send time for RTT calculation if it's a data packet
+        if message.get("type") == "msg":
+            self.send_times[message["seq"]] = time.time()
 
     def recv(self, socket):
         data, addr = socket.recvfrom(65535)
@@ -39,16 +68,136 @@ class Sender:
         else:
             self.log("Received message %s" % data)
             return json.loads(data.decode("utf-8"))
+            
+    def update_rtt(self, seq):
+        """Update RTT estimate based on ACK received."""
+        if seq in self.send_times:
+            # Calculate sample RTT
+            sample_rtt = time.time() - self.send_times[seq]
+            self.log(f"Sample RTT for packet {seq}: {sample_rtt:.4f}s")
+            
+            if self.estimated_rtt == 0:
+                # First RTT sample
+                self.estimated_rtt = sample_rtt
+                self.dev_rtt = sample_rtt / 2
+            else:
+                # Update RTT estimate using EWMA (Exponentially Weighted Moving Average)
+                # Based on Jacobson/Karels algorithm (TCP RTT estimation)
+                self.dev_rtt = (1 - self.beta) * self.dev_rtt + self.beta * abs(sample_rtt - self.estimated_rtt)
+                self.estimated_rtt = (1 - self.alpha) * self.estimated_rtt + self.alpha * sample_rtt
+            
+            # Calculate timeout value (RTO) with 4*dev_rtt safety margin
+            timeout = self.estimated_rtt + 4 * self.dev_rtt
+            
+            # Clamp timeout to reasonable values
+            timeout = max(self.min_timeout, min(self.max_timeout, timeout))
+            
+            self.log(f"Updated RTT estimate: {self.estimated_rtt:.4f}s, deviation: {self.dev_rtt:.4f}s, timeout: {timeout:.4f}s")
+            
+            # Clean up send_times dictionary
+            del self.send_times[seq]
+            
+            return timeout
+        
+        # Default timeout if no RTT sample available
+        return self.estimated_rtt + 4 * self.dev_rtt
+        
+    def adjust_window_size(self, success=True):
+        """Adjust window size based on network conditions."""
+        if success:
+            # Additive increase: add 1 to window size on successful transmission
+            self.window_size = min(self.window_size + 1, self.max_window_size)
+        else:
+            # Multiplicative decrease: cut window size in half on timeout
+            self.window_size = max(1, self.window_size // 2)
+        
+        self.log(f"Adjusted window size to {self.window_size}")
 
     def run(self):
-        seq = 0
         data = sys.stdin.read()  # Read all input at once
+        chunks = []
+        
+        # Split data into chunks
         while data:
-            msg = { "type": "msg", "data": data[:DATA_SIZE], "seq": seq }
-            self.send(msg)
-            data = data[DATA_SIZE:]  # Move to the next chunk
-            seq += 1
-            time.sleep(0.1)  # Add a small delay if needed
+            chunks.append(data[:DATA_SIZE])
+            data = data[DATA_SIZE:]
+        
+        total_chunks = len(chunks)
+        self.log(f"Total chunks to send: {total_chunks}")
+        
+        # Initialize sliding window
+        self.next_seq_to_send = 0
+        self.base_seq = 0
+        
+        # Continue until all chunks are acknowledged
+        while self.base_seq < total_chunks:
+            # Send packets within the window
+            while self.next_seq_to_send < total_chunks and self.next_seq_to_send < self.base_seq + self.window_size:
+                if self.next_seq_to_send not in self.in_flight:
+                    # Create and send new packet
+                    chunk = chunks[self.next_seq_to_send]
+                    checksum = self.calculate_checksum(chunk)
+                    msg = {"type": "msg", "data": chunk, "seq": self.next_seq_to_send, "checksum": checksum}
+                    self.send(msg)
+                    self.in_flight[self.next_seq_to_send] = msg
+                    self.next_seq_to_send += 1
+            
+            # Calculate timeout
+            timeout = self.estimated_rtt + 4 * self.dev_rtt
+            timeout = max(self.min_timeout, min(self.max_timeout, timeout))
+            
+            # Wait for ACKs or timeout
+            ready = select.select([self.socket], [], [], timeout)[0]
+            
+            if not ready:
+                # Timeout occurred, resend oldest unacknowledged packet
+                self.log(f"Timeout waiting for ACK, resending packet {self.base_seq}")
+                if self.base_seq in self.in_flight:
+                    self.send(self.in_flight[self.base_seq])
+                    # Reduce window size on timeout
+                    self.adjust_window_size(success=False)
+                continue
+            
+            # Process incoming messages
+            for s in ready:
+                response = self.recv(s)
+                
+                if response and response["type"] == "ack":
+                    ack_seq = response["seq"]
+                    
+                    # Check if this is a duplicate ACK
+                    if ack_seq < self.base_seq:
+                        self.duplicate_acks[ack_seq] += 1
+                        if self.duplicate_acks[ack_seq] >= 3:
+                            # Fast retransmit on 3 duplicate ACKs
+                            self.log(f"Fast retransmit for packet {ack_seq + 1} after 3 duplicate ACKs")
+                            if ack_seq + 1 in self.in_flight:
+                                self.send(self.in_flight[ack_seq + 1])
+                        continue
+                    
+                    # Update RTT estimate
+                    self.update_rtt(ack_seq)
+                    
+                    # Clear duplicate ACK counter
+                    if ack_seq in self.duplicate_acks:
+                        del self.duplicate_acks[ack_seq]
+                    
+                    # Cumulative ACK: all packets up to and including ack_seq are acknowledged
+                    for seq in range(self.base_seq, ack_seq + 1):
+                        if seq in self.in_flight:
+                            del self.in_flight[seq]
+                    
+                    # Move window forward
+                    if ack_seq >= self.base_seq:
+                        self.base_seq = ack_seq + 1
+                        # Increase window size on successful ACK
+                        self.adjust_window_size(success=True)
+                
+                elif response and response["type"] == "nack":
+                    nack_seq = response["seq"]
+                    self.log(f"Received NACK for packet {nack_seq} (checksum failed), resending")
+                    if nack_seq in self.in_flight:
+                        self.send(self.in_flight[nack_seq])
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='send data')
